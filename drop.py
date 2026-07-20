@@ -1,13 +1,5 @@
-"""DROP/SBE helpers: read field names from drop.xml and match scenario lines
-against a live or replay message stream.
-
-Two matching modes share one set of decode/compare primitives:
-  - Existence (TST): order-independent; a line matches any message in the
-    stream. Used for reference/snapshot data (users, firms, securities).
-  - Sequence (SEQ): ordered lifecycle; steps must match in stream order, with
-    '@name' tokens binding an identity (e.g. orderId) across steps. Used for
-    order lifecycles: accept -> trade -> trade confirmed for the same order.
-"""
+"""DROP/SBE scenario matching: map schema field names and match TST lines
+against the message stream. Order-independent; reads the stream lazily."""
 
 import xml.etree.ElementTree as ET
 
@@ -32,11 +24,9 @@ def get_metadata(cfg):
 
 
 def decode_value(value):
-    """Return a decoded string for one decoded tuple value.
+    """Return one decoded tuple value as a comparable string."""
 
-    SBE strings are fixed-width and padded with null bytes (and sometimes
-    spaces), so both are stripped to compare against scenario values.
-    """
+    # SBE strings are fixed-width, padded with null bytes and sometimes spaces.
 
     if isinstance(value, bytes):
         value = value.decode('utf-8', 'replace')
@@ -53,6 +43,12 @@ def is_payload(message):
     return decode_value(message[1]) != 'H'
 
 
+def is_binding(token):
+    """Return True if an expected value is a correlation token like '@orderId'."""
+
+    return isinstance(token, str) and token.startswith('@') and len(token) > 1
+
+
 def expected_values(expected_msg):
     """Return stripped expected values, dropping an operator/user prefix if present."""
 
@@ -65,13 +61,9 @@ def expected_values(expected_msg):
 
     return [value if is_binding(value) else decode_value(value) for value in fields]
 
-def resolve_dates(values, resolver):
-    """Resolve {TODAY}/{NOW}/{WEEKEND}/{HOLIDAY} tokens in DROP scenario values.
 
-    DROP dates are LocalDate (yyyyMMdd), so tokens resolve to that format.
-    The resolver is passed in (soup.resolve_dynamic_date) so this stays free of
-    any soup/session dependency; non-token values pass through unchanged.
-    """
+def resolve_dates(values, resolver):
+    """Resolve {TODAY}/{NOW} style date tokens; DROP dates are LocalDate (yyyyMMdd)."""
 
     resolved = []
     for value in values:
@@ -81,14 +73,11 @@ def resolve_dates(values, resolver):
             resolved.append(value)
     return resolved
 
-def has_soup_fields(values):
-    """Return True if a TST line's values include the soup header fields.
 
-    A soup line begins packetLength|msgType|blockLength|... where msgType (the
-    second value) is a letter such as 'S' or 'H'. A plain line begins
-    blockLength|templateId|... where the second value is templateId, a number.
-    The second value being alphabetic is the reliable, collision-free signal.
-    """
+def has_soup_fields(values):
+    """Return True if a TST line starts with the soup header fields."""
+
+    # msgType (soup line) is alphabetic; templateId (plain line) is numeric.
 
     if len(values) < 2:
         return False
@@ -102,13 +91,7 @@ def has_soup_fields(values):
 
 
 def compare(cfg, message, values, with_soup=False):
-    """Compare one message against expected values.
-
-    Yields (field_name, received_value, expected_value, ok) per expected value.
-    'IGN' always passes, even when the message is None. A non-IGN field fails
-    when the message is None (not found) or the received value differs. When
-    with_soup is True the soup header fields (packetLength, msgType) are matched.
-    """
+    """Yield (field_name, received, expected, ok) per value; IGN always passes."""
 
     metadata = get_metadata(cfg)
     indexes = metadata.compare_indexes(values, with_soup)
@@ -131,58 +114,20 @@ def compare(cfg, message, values, with_soup=False):
         yield field_name, received_value, expected_value, received_value == expected_value
 
 
-def matches(cfg, message, values, with_soup=False):
-    """Return True if a message matches every expected value of a TST/TSTS line."""
 
-    if not is_payload(message):
-        return False
-
-    template_position = 3 if with_soup else 1
-
-    if decode_value(message[TEMPLATE_ID_INDEX]) != values[template_position]:
-        return False
-
-    return all(ok for _, _, _, ok in compare(cfg, message, values, with_soup))
-
-
-def drain_stream(receive, max_reads):
-    """Read the replay/live stream once into a list of DROP payloads.
-
-    receive() blocks and returns None for filtered messages, so None reads are
-    skipped rather than treated as the end. A SoupConnectionError means the
-    replay finished and the peer closed, which cleanly ends the drain.
-    """
-
-    stream = []
-
-    try:
-        for _ in range(max_reads):
-            message = receive()
-
-            if is_payload(message):
-                stream.append(message)
-
-    except Exception as error:
-        # End of replay (peer disconnected) or read error: stop with what we have.
-        if type(error).__name__ != 'SoupConnectionError':
-            raise
-
-    return stream
 
 def find_match_streaming(cfg, buffer, receive, exhausted_flag, values, with_soup=False):
-    """Find a match, reading forward from the socket only as needed (C1).
+    """Match against the buffer, reading further from the socket only if needed."""
 
-    For huge feeds: searches the already-buffered messages first (so earlier
-    scenarios' reads are reused), and only if no match is found reads more from
-    the socket, appending payloads to buffer, until the match arrives or the
-    stream ends. This bounds reading to the deepest message any scenario needs,
-    instead of draining the whole feed up front.
-    """
+    # Bounds reading to the deepest message any scenario asserts, so a large
+    # feed is never drained up front.
 
+    # First try whatever is already buffered (order-independent, reused reads).
     match = find_match(cfg, buffer, values, with_soup)
     if match is not None and _is_full_match(cfg, match, values, with_soup):
         return match
 
+    # Keep the best identity-fallback seen so far, in case no full match exists.
     identity = match
 
     if exhausted_flag[0]:
@@ -191,9 +136,12 @@ def find_match_streaming(cfg, buffer, receive, exhausted_flag, values, with_soup
     template_position = 3 if with_soup else 1
     key_position = _key_position(values, with_soup)
     key_value = values[key_position] if key_position is not None else None
-    
+
     try:
         while True:
+            # A message the decoder cannot unpack is skipped rather than
+            # aborting the run; soup framing stays aligned because the body is
+            # consumed by its header length before unpacking.
             try:
                 message = receive()
             except Exception as read_error:
@@ -220,11 +168,14 @@ def find_match_streaming(cfg, buffer, receive, exhausted_flag, values, with_soup
                 identity = message
 
     except Exception as error:
+        # Stream ended (peer disconnected) or read error: mark exhausted so later
+        # scenarios search only the buffer instead of reading a closed socket.
         if type(error).__name__ != 'SoupConnectionError':
             raise
         exhausted_flag[0] = True
 
     return identity
+
 
 def _is_full_match(cfg, message, values, with_soup=False):
     """Return True if a message matches every field (not just identity fallback)."""
@@ -239,15 +190,12 @@ def _is_full_match(cfg, message, values, with_soup=False):
 
     return all(ok for _, _, _, ok in compare(cfg, message, values, with_soup))
 
-def find_match(cfg, stream, values, with_soup=False):
-    """Return the best buffered message for a TST/TSTS line, or None.
 
-    Order-independent. Prefers a message matching every field. If none matches
-    fully, falls back to the message with the same template and the same key
-    field (the first concrete, non-IGN body field, e.g. userId), so its actual
-    values are shown and the wrong field fails visibly instead of all-NULL.
-    Returns None only when no message even shares that identity.
-    """
+def find_match(cfg, stream, values, with_soup=False):
+    """Return the best buffered message for a TST line, or None."""
+
+    # Falls back to a same-identity record so a wrong field shows its real
+    # value instead of every field reporting NULL.
 
     full = None
     identity = None
@@ -275,12 +223,7 @@ def find_match(cfg, stream, values, with_soup=False):
 
 
 def _key_position(values, with_soup=False):
-    """Return the index of the first concrete (non-IGN) body field, or None.
-
-    Header fields are skipped; the first non-IGN body field is used as the
-    record identity for fallback matching. The header spans 6 fields with soup,
-    4 without.
-    """
+    """Return the index of the first non-IGN body field, used as record identity."""
 
     header_len = len(SOUP_HEADER) + len(SBE_HEADER) if with_soup else len(SBE_HEADER)
 
@@ -302,114 +245,6 @@ def _field_equals(cfg, message, values, position, expected, with_soup=False):
     return decode_value(message[index]) == expected
 
 
-# --- Ordered lifecycle matching (SEQ) with @name correlation -----------------
-#
-# A SEQ scenario is a list of steps that must appear in the stream in order.
-# A step field written as '@name' binds that field's received value the first
-# time it is seen; later steps writing the same '@name' must match the bound
-# value. This threads an identity (e.g. orderId) through an order lifecycle:
-# accept -> trade -> trade confirmed, all for the same order.
-
-
-def is_binding(token):
-    """Return True if an expected value is a correlation token like '@orderId'."""
-
-    return isinstance(token, str) and token.startswith('@') and len(token) > 1
-
-
-def resolve_values(values, bindings):
-    """Return expected values with bound '@name' tokens replaced by their value.
-
-    An unbound '@name' becomes 'IGN' (it captures on match rather than compares);
-    a bound '@name' becomes the previously captured value so it must match.
-    """
-
-    resolved = []
-
-    for value in values:
-        if is_binding(value):
-            resolved.append(bindings.get(value[1:], 'IGN'))
-        else:
-            resolved.append(value)
-
-    return resolved
-
-
-def capture_bindings(cfg, message, values, bindings):
-    """Bind every '@name' token in a step to the message's received value.
-
-    Only unbound names are captured; already-bound names are left unchanged so
-    the first occurrence defines the identity for the rest of the sequence.
-    """
-
-    indexes = get_metadata(cfg).compare_indexes(values)
-
-    for position, value in enumerate(values):
-        if not is_binding(value):
-            continue
-
-        name = value[1:]
-        index = indexes[position]
-
-        if name not in bindings and message is not None and len(message) > index:
-            bindings[name] = decode_value(message[index])
-
-
-def step_matches(cfg, message, values, bindings):
-    """Return True if a message matches a step, honoring current bindings."""
-
-    if not is_payload(message):
-        return False
-
-    if decode_value(message[TEMPLATE_ID_INDEX]) != values[1]:
-        return False
-
-    resolved = resolve_values(values, bindings)
-    return all(ok for _, _, _, ok in compare(cfg, message, resolved))
-
-
-def match_sequence(cfg, stream, steps):
-    """Match ordered lifecycle steps against the stream, returning per-step results.
-
-    steps is a list of expected-value lists. Each step must match a message that
-    appears after the previous step's match (ordering). '@name' tokens bind on
-    first match and must match the bound value thereafter (correlation).
-
-    Returns a list of (message_or_None, resolved_values) aligned to steps, so the
-    caller can render each with compare(). A step that cannot be found after the
-    prior match yields (None, resolved_values) and fails on NULL; later steps
-    then also fail, because the ordering chain is broken.
-    """
-
-    results = []
-    bindings = {}
-    cursor = 0
-
-    for values in steps:
-        resolved = resolve_values(values, bindings)
-        found = None
-
-        position = cursor
-        while position < len(stream):
-            message = stream[position]
-
-            if step_matches(cfg, message, values, bindings):
-                found = message
-                cursor = position + 1
-                break
-
-            position += 1
-
-        if found is not None:
-            capture_bindings(cfg, found, values, bindings)
-            # Re-resolve so the rendered expectation shows the now-bound values.
-            resolved = resolve_values(values, bindings)
-
-        results.append((found, resolved))
-
-    return results
-
-
 class DropMetadata:
     """Read DROP/SBE message and composite field names from drop.xml."""
 
@@ -422,12 +257,10 @@ class DropMetadata:
         self._load(xml_file)
 
     def compare_indexes(self, values, with_soup=False):
-        """Return decoded tuple indexes for a TST/TSTS line's expected values.
+        """Return decoded tuple indexes for a TST line's expected values."""
 
-        Header fields map first; a partial body maps to the last body fields so
-        scenarios can skip unstable leading fields. When with_soup is True the
-        two soup header fields (packetLength, msgType) precede the SBE header.
-        """
+        # A partial body right-aligns to the last fields, so scenarios can omit
+        # leading fields.
 
         header = list(SOUP_HEADER) + list(SBE_HEADER) if with_soup else list(SBE_HEADER)
         template_position = 3 if with_soup else 1
@@ -463,12 +296,7 @@ class DropMetadata:
         return self._field_map(int(values[template_position])).get(index, "DROP[%s]" % index)
 
     def _load(self, xml_file):
-        """Parse messages, composites, and types from the schema.
-
-        Resolves any <xi:include> so composites/types defined in an included
-        file (e.g. mercury.common.v1.xml) are available for field expansion.
-        Composite members may be <ref>, <field>, or <type> (inline scalars).
-        """
+        """Parse the schema, resolving <xi:include> for the common definitions."""
 
         import os
 

@@ -36,7 +36,6 @@ class MessageHandler:
         self.users = {}
         self.drop_stream = []
         self.drop_exhausted = [False]
-        self.drop_max_reads = getattr(cfg, 'drop_max_reads', 100000)
 
         # Conditional import for running QA tests
         if self.cfg.run_qa:
@@ -186,15 +185,12 @@ class MessageHandler:
 
         if mode == 'D':
             print("Error: SND is not supported for DROP mode (user %s). "
-                  "DROP scenarios are listen-only; use TST/SEQ to assert on the "
+                  "DROP scenarios are listen-only; use TST to assert on the "
                   "stream instead of sending." % user)
             sys.exit(1)
 
-        # The admin/control API (mode 'a', mercury_api.json) accepts one
-        # command per connection and closes the socket afterward, so a fresh
-        # connection is opened before every send rather than reusing the one
-        # from _login_all or the previous SND. Reusing it hits a broken pipe
-        # on the write, since the server has already closed its end.
+        # The admin API (mode 'a') closes the socket after one command, so a
+        # fresh connection is opened before every send to avoid a broken pipe.
         if mode == 'a':
             self.login(user, quiet=True)
 
@@ -206,9 +202,9 @@ class MessageHandler:
         self.tkh.increment_token(user)
         sys.stdout.write("SND ")
         self.printer.print_details(user, "Out", self.users[user].send(msg))
-    
+
     def _scenario_receive(self, msg):
-        """ Receive and check one scenario message (DROP matches a buffered stream) """
+        """ Receive and check one scenario message (DROP matches the feed stream) """
         user, msg = self._convert_token(msg)
         mode = self.cfg.user_config[self.cfg.board][user]['mode']
 
@@ -243,9 +239,10 @@ class MessageHandler:
                 traceback.print_exc()
                 print("Error in subscenario %s" % self.sub_scenario)
                 sys.exit(0)
+
     def _drop_receive(self, user, msg, with_soup=False):
+        """ Match one DROP TST line against the feed, reading further only if needed """
         values = drop.expected_values(msg)
-        # stream = self._drop_stream_buffer(user)
         matched = drop.find_match_streaming(
             self.cfg, self.drop_stream, self.users[user].receive,
             self.drop_exhausted, values, with_soup
@@ -256,13 +253,6 @@ class MessageHandler:
             self.printer.print_details(user, "In", matched)
 
         self.qah.check_scenario(matched, msg, user, 2, with_soup=with_soup)
-
-    def _drop_stream_buffer(self, user):
-        if self.drop_stream is None:
-            self.drop_stream = drop.drain_stream(
-                self.users[user].receive, self.drop_max_reads
-            )
-        return self.drop_stream
 
     def _scenario_begin(self, msg):
         """ Begin scenario """
@@ -315,16 +305,12 @@ class MessageHandler:
         print("Result          : %s" % ("PASSED" if self.qa_failed_scenarios == 0 else "FAILED"))
 
     def __get_scenario_files(self):
-        """Return scenario file paths, skipping non-scenario files in a -D dir.
-
-        A scenario directory can accumulate reference docs, generated output,
-        or editor artifacts (e.g. .txt notes, _output files, dotfiles). Those
-        are not valid scenarios and would break BGN/TST/END parsing, so a -D
-        directory run only picks up files that look like scenario files.
-        """
+        """Return scenario file paths, skipping non-scenario files in a -D dir."""
         if self.cfg.scenario_file:
             return [self.cfg.scenario_file]
 
+        # A scenario directory can hold reference docs or generated output,
+        # which would otherwise be parsed as scenarios.
         (scenario_dir, _, scenario_files) = next(os.walk(self.cfg.scenario_dir))
         file_paths = []
         for scenario_file in scenario_files:
